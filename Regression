@@ -1,0 +1,129 @@
+# --- Mutual Fund 3-Year Performance Regression ---
+# Y:  "3-yr ret"
+# X:  logtna, size_sq, exp_ratio, turn_ratio, age_mo, sigma
+
+
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+import patsy
+from pathlib import Path
+
+# --------------------
+# 1) Load spreadsheet
+# --------------------
+fname = "Size_Performance_Small_Cap_Growth-1.xls"  # change to .xlsx if you converted
+p = Path(fname)
+if not p.exists():
+    raise FileNotFoundError(f"Cannot find file: {p.resolve()}")
+
+if p.suffix.lower() == ".xls":
+    try:
+        import xlrd
+    except ImportError as e:
+        raise ImportError("Reading .xls requires 'xlrd>=2.0.1'. Install it or save the file as .xlsx.") from e
+    df = pd.read_excel(p, engine="xlrd")
+else:
+    df = pd.read_excel(p)  # .xlsx will auto-use openpyxl if installed
+
+# ------------------------
+# 2) Normalize column names
+# ------------------------
+rename_map = {
+    "3-yr ret": "ret_3y",  # dependent variable
+    "age_mo":   "age_me",  # months; your requested name
+}
+df = df.rename(columns=rename_map)
+
+# Sanity check: required columns must exist
+required = ["ret_3y", "logtna", "size_sq", "exp_ratio", "turn_ratio", "age_me", "sigma"]
+missing = [c for c in required if c not in df.columns]
+if missing:
+    raise KeyError(f"Missing required columns: {missing}")
+
+# Optional FE column (Lipper style classification)
+fe_col = "lipper_class" if "lipper_class" in df.columns else None
+
+# ------------------------------------
+# 3) Build model frame and regression
+# ------------------------------------
+regressors = ["logtna", "size_sq", "exp_ratio", "turn_ratio", "age_me", "sigma"]
+needed = ["ret_3y"] + regressors + ([fe_col] if fe_col else [])
+model_df = df.dropna(subset=needed).copy()
+
+# Baseline (no FE)
+formula_base = "ret_3y ~ " + " + ".join(regressors)
+
+# With FE (recommended given your influence diagnostics)
+formula_fe = formula_base + (f" + C({fe_col})" if fe_col and model_df[fe_col].nunique() > 1 else "")
+
+def fit_hc1(formula: str, data: pd.DataFrame):
+    y, X = patsy.dmatrices(formula, data, return_type="dataframe")
+    res = sm.OLS(y, X).fit(cov_type="HC1")
+    return res, X
+
+res_base, X_base = fit_hc1(formula_base, model_df)
+res_fe,   X_fe   = fit_hc1(formula_fe,   model_df)
+
+# ---------------------------
+# 4) Variance Inflation Factors
+# ---------------------------
+def compute_vif(Xnum: pd.DataFrame) -> pd.DataFrame:
+    X_ = Xnum.copy()
+    if "const" not in X_.columns:
+        X_ = sm.add_constant(X_, has_constant="add")
+    rows = []
+    for col in X_.columns:
+        if col == "const":
+            continue
+        y_i = X_[col]
+        X_i = X_.drop(columns=[col])
+        r2 = sm.OLS(y_i, X_i).fit().rsquared
+        vif = 1.0 / max(1.0 - r2, 1e-12)
+        rows.append({"variable": col, "VIF": vif})
+    return pd.DataFrame(rows).sort_values("VIF", ascending=False)
+
+# VIFs only for numeric original regressors (exclude any FE dummies)
+X_fe_num = X_fe.select_dtypes(include=[np.number]).copy()
+X_fe_num = X_fe_num[[c for c in X_fe_num.columns if not c.startswith("C(")]]
+vif_table = compute_vif(X_fe_num)
+
+# ---------------------------
+# 5) Influence (Cook’s D)
+# ---------------------------
+infl_fe = res_fe.get_influence()
+model_df = model_df.assign(cooks_d=infl_fe.cooks_distance[0])
+top10_infl = model_df.nlargest(10, "cooks_d")[["cooks_d"] + ([fe_col] if fe_col else [])]
+
+# ---------------------------
+# 6) Output
+# ---------------------------
+print("\n=== Baseline OLS (HC1 robust SEs) — No Fixed Effects ===")
+print("Formula:", formula_base)
+print(res_base.summary())
+
+print("\n=== OLS with Category Fixed Effects (HC1 robust SEs) ===")
+print("Formula:", formula_fe)
+print(res_fe.summary())
+
+print("\n=== Variance Inflation Factors (for specified regressors) ===")
+print(vif_table.to_string(index=False))
+
+print("\n=== Top 10 Influential Observations (Cook's D) — FE Model ===")
+print(top10_infl)
+
+# Optional: save compact results tables to files
+try:
+    import statsmodels.iolib.summary2 as smsum
+    comp = smsum.summary_col([res_base, res_fe],
+                             stars=True,
+                             model_names=["No FE", "FE"],
+                             info_dict={"N": lambda x: f"{int(x.nobs)}",
+                                        "R2": lambda x: f"{x.rsquared:.3f}"})
+    with open("regression_summary.txt", "w") as fh:
+        fh.write(str(comp))
+    vif_table.to_csv("vif_table.csv", index=False)
+    top10_infl.to_csv("top10_cooksd.csv", index=False)
+    print("\nSaved: regression_summary.txt, vif_table.csv, top10_cooksd.csv")
+except Exception as e:
+    print("\n(Export skipped)", e) 
